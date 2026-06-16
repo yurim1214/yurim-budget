@@ -534,7 +534,7 @@ function cell(d,sums){
   if(!d){c.className='cell empty';return c}
   const key=ymd(d),dw=d.getDay();
   c.className='cell'+(dw===0?' sun':dw===6?' sat':'')+(key===ymd(RT)?' today':'');
-  const label=(d.getDate()===1)?((d.getMonth()+1)+'. '+d.getDate()+'.'):d.getDate();
+  const label=d.getDate();
   let h='<div class="dn">'+label+'</div>';
   if(sums){if(sums.in)h+='<div class="amt in num">'+cellAmt(sums.in)+'</div>';if(sums.ex)h+='<div class="amt ex num">'+cellAmt(sums.ex)+'</div>'}
   c.innerHTML=h;c.onclick=()=>openDay(key);return c;
