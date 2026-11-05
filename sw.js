@@ -1,8 +1,9 @@
 /* 유림 가계부 서비스워커 — 앱 셸 오프라인 캐싱 */
-const CACHE = 'yunseul-v2';
+const CACHE = 'yunseul-v3';
 const ASSETS = [
   './',
   './index.html',
+  './app.js',
   './manifest.webmanifest',
   './apple-touch-icon.png',
   './icon-192.png',
@@ -22,18 +23,27 @@ self.addEventListener('activate', e => {
 
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
-  // 외부(Supabase, CDN) 요청은 캐시하지 않고 그대로 네트워크로
-  if (url.origin !== self.location.origin) return;
+  // Supabase 요청은 캐시하지 않고 그대로 네트워크로
+  if (url.origin !== self.location.origin) {
+    // 글꼴·라이브러리(CDN)는 한 번 받으면 캐시해서 오프라인에서도 열리게
+    if (/cdn\.jsdelivr\.net$/.test(url.hostname) && e.request.method === 'GET') {
+      e.respondWith(caches.match(e.request).then(hit => hit || fetch(e.request).then(res => {
+        const copy = res.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {}); return res;
+      })));
+    }
+    return;
+  }
 
-  const isHTML = e.request.mode === 'navigate' || url.pathname.endsWith('/') || url.pathname.endsWith('index.html');
-  if (isHTML) {
-    // HTML은 네트워크 우선 → 수정사항이 바로 반영됨, 오프라인이면 캐시
+  const isShell = e.request.mode === 'navigate' || url.pathname.endsWith('/') || url.pathname.endsWith('.html') || url.pathname.endsWith('.js');
+  if (isShell) {
+    // 앱 화면·코드는 네트워크 우선 → 수정사항이 바로 반영됨, 오프라인이면 캐시
     e.respondWith(
       fetch(e.request).then(res => {
         const copy = res.clone();
-        caches.open(CACHE).then(c => c.put('./index.html', copy)).catch(() => {});
+        const key = e.request.mode === 'navigate' ? './index.html' : e.request;
+        caches.open(CACHE).then(c => c.put(key, copy)).catch(() => {});
         return res;
-      }).catch(() => caches.match('./index.html'))
+      }).catch(() => caches.match(e.request).then(hit => hit || caches.match('./index.html')))
     );
     return;
   }
