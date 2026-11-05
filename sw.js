@@ -1,5 +1,5 @@
 /* 유림 가계부 서비스워커 — 앱 셸 오프라인 캐싱 */
-const CACHE = 'yunseul-v3';
+const CACHE = 'yunseul-v4';
 const ASSETS = [
   './',
   './index.html',

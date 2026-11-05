@@ -930,7 +930,143 @@ begin
 end $$;
 drop trigger if exists ys_touch on ys_items;
 create trigger ys_touch before insert or update on ys_items
-  for each row execute function ys_touch();`;
+  for each row execute function ys_touch();
+
+-- 4) 위젯·단축어 전용 통로: "연결 코드" 하나로 읽기 + 내역 추가만 가능
+create table if not exists ys_keys (
+  user_id uuid primary key,
+  key_hash text not null,
+  created_at timestamptz default now()
+);
+alter table ys_keys enable row level security;
+
+create or replace function ys_key_create() returns text
+language plpgsql security definer set search_path = public as $$
+declare k text;
+begin
+  if auth.uid() is null then raise exception '로그인이 필요해요'; end if;
+  k := replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '');
+  insert into ys_keys (user_id, key_hash)
+    values (auth.uid(), encode(sha256(convert_to(k, 'UTF8')), 'hex'))
+    on conflict (user_id) do update set key_hash = excluded.key_hash, created_at = now();
+  return k;
+end $$;
+
+create or replace function ys_key_revoke() returns void
+language sql security definer set search_path = public as $$
+  delete from ys_keys where user_id = auth.uid();
+$$;
+
+create or replace function ys_w_user(p_key text) returns uuid
+language plpgsql security definer set search_path = public stable as $$
+declare uid uuid;
+begin
+  select user_id into uid from ys_keys
+    where key_hash = encode(sha256(convert_to(coalesce(p_key, ''), 'UTF8')), 'hex');
+  if uid is null then raise exception '연결 코드가 맞지 않아요. 앱에서 새로 만들어 주세요.'; end if;
+  return uid;
+end $$;
+
+create or replace function ys_w_ledger(p_uid uuid, p_ledger text) returns text
+language plpgsql security definer set search_path = public stable as $$
+declare lg text := coalesce(nullif(trim(p_ledger), ''), 'p_' || p_uid::text);
+begin
+  if exists (select 1 from ledger_members where code = lg and user_id = p_uid) then return lg; end if;
+  select m.code into lg from ledger_members m
+    join ys_items i on i.ledger = m.code and i.kind = 'meta' and not i.deleted
+    where m.user_id = p_uid and i.data->>'name' = trim(p_ledger) limit 1;
+  if lg is null then raise exception '「%」 가계부를 찾을 수 없어요', p_ledger; end if;
+  return lg;
+end $$;
+
+create or replace function ys_w_catlist(p_ledger text, p_type text)
+returns table (id text, label text)
+language sql security definer set search_path = public stable as $$
+  select c.data->>'id',
+         case when p.data is not null
+           then coalesce(nullif(p.data->>'e', '') || ' ', '') || (p.data->>'n') || ' › ' || (c.data->>'n')
+           else coalesce(nullif(c.data->>'e', '') || ' ', '') || (c.data->>'n') end
+  from ys_items c
+  left join ys_items p on p.ledger = c.ledger and p.kind = 'cat' and not p.deleted
+    and p.data->>'id' = c.data->>'p'
+  where c.ledger = p_ledger and c.kind = 'cat' and not c.deleted and c.data->>'t' = p_type
+  order by coalesce((coalesce(p.data, c.data)->>'o')::numeric, 999),
+           coalesce(p.data, c.data)->>'n',
+           case when p.data is null then -1 else coalesce((c.data->>'o')::numeric, 999) end;
+$$;
+
+create or replace function ys_w_items(p_key text, p_ledger text default null) returns jsonb
+language plpgsql security definer set search_path = public stable as $$
+declare uid uuid := ys_w_user(p_key); lg text := ys_w_ledger(uid, p_ledger);
+begin
+  return jsonb_build_object('ledger', lg, 'items', coalesce((
+    select jsonb_agg(jsonb_build_object('k', kind, 'd', data))
+    from ys_items where ledger = lg and not deleted
+      and kind in ('meta', 'cat', 'tx', 'acct', 'pay')), '[]'::jsonb));
+end $$;
+
+create or replace function ys_w_cats(p_key text, p_type text default 'expense', p_ledger text default null)
+returns jsonb
+language plpgsql security definer set search_path = public stable as $$
+declare uid uuid := ys_w_user(p_key); lg text := ys_w_ledger(uid, p_ledger);
+begin
+  return coalesce((select jsonb_agg(label) from ys_w_catlist(lg, p_type)), '[]'::jsonb)
+    || '["분류 안 함"]'::jsonb;
+end $$;
+
+create or replace function ys_w_add(p_key text, p_amount text, p_type text default 'expense',
+  p_cat text default null, p_memo text default null, p_pay text default null,
+  p_date text default null, p_ledger text default null) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  uid uuid := ys_w_user(p_key); lg text := ys_w_ledger(uid, p_ledger);
+  amt numeric; d date; cid text; clabel text; pid text; txid text; ms bigint; doc jsonb;
+begin
+  if p_type not in ('expense', 'income') then raise exception '구분은 expense 또는 income 이어야 해요'; end if;
+  begin
+    amt := round(replace(replace(coalesce(p_amount, ''), ',', ''), ' ', '')::numeric, 2);
+  exception when others then raise exception '금액을 숫자로 입력해 주세요';
+  end;
+  if amt is null or amt <= 0 then raise exception '금액을 입력해 주세요'; end if;
+  d := coalesce(nullif(trim(p_date), '')::date, (now() at time zone 'Asia/Seoul')::date);
+
+  select l.id, l.label into cid, clabel from ys_w_catlist(lg, p_type) l
+    where l.label = trim(p_cat) limit 1;
+  if cid is null and nullif(trim(p_cat), '') is not null then
+    select l.id, l.label into cid, clabel from ys_w_catlist(lg, p_type) l
+      where l.label like '%' || trim(p_cat) limit 1;
+  end if;
+  if cid is null and nullif(trim(p_cat), '') is null then
+    select l.id, l.label into cid, clabel from ys_w_catlist(lg, p_type) l
+      join ys_items c on c.ledger = lg and c.kind = 'cat' and c.data->>'id' = l.id
+      where (c.data->>'def')::boolean limit 1;
+  end if;
+  cid := coalesce(cid, 'none'); clabel := coalesce(clabel, '분류 안 함');
+
+  if p_type = 'expense' then
+    select data->>'id' into pid from ys_items
+      where ledger = lg and kind = 'pay' and not deleted
+        and (data->>'n' = trim(p_pay) or coalesce(nullif(data->>'e', '') || ' ', '') || (data->>'n') = trim(p_pay))
+      limit 1;
+    if pid is null and nullif(trim(p_pay), '') is null then
+      select data->>'id' into pid from ys_items
+        where ledger = lg and kind = 'pay' and not deleted and (data->>'def')::boolean limit 1;
+    end if;
+  end if;
+
+  ms := (extract(epoch from clock_timestamp()) * 1000)::bigint;
+  txid := 'w' || ms::text || substr(md5(random()::text), 1, 4);
+  doc := jsonb_strip_nulls(jsonb_build_object('id', txid, 'type', p_type, 'amount', amt,
+    'date', to_char(d, 'YYYY-MM-DD'), 'cat', cid, 'memo', coalesce(trim(p_memo), ''), 'pay', pid));
+  insert into ys_items (id, ledger, kind, data, updated_at, deleted, user_id)
+    values ('tx:' || lg || ':' || txid, lg, 'tx', doc, ms, false, uid);
+  return jsonb_build_object('ok', true, 'id', txid,
+    'message', clabel || ' ' || rtrim(to_char(amt, 'FM999,999,999,990.99'), '.') || ' 기록했어요');
+end $$;
+
+revoke all on function ys_w_user(text) from public, anon, authenticated;
+revoke all on function ys_w_ledger(uuid, text) from public, anon, authenticated;
+revoke all on function ys_w_catlist(text, text) from public, anon, authenticated;`;
 function sbCfg() { return rawGet('yunseul_sb'); }
 function initSb() { const c = sbCfg(); if (c && window.supabase) { sb = window.supabase.createClient(c.url, c.key); return true; } return false; }
 function isMissingTable(e) { return e && (e.code === '42P01' || e.code === 'PGRST205' || e.code === 'PGRST202' || /ys_items|does not exist|schema cache/i.test(e.message || '')); }
@@ -1047,11 +1183,45 @@ function renderSync() {
   else if (Sync.err) h += '<div class="status warn"><b>동기화 오류</b><br>' + esc(Sync.err.message || Sync.err) + '</div>';
   h += '<div class="status">✅ <b>' + esc(sbUser.email) + '</b> 로그인됨<br>내역·분류·자산·결제 수단·가계부 설정이 모든 기기에 자동으로 맞춰져요.' + (last ? '<br>마지막 동기화: ' + new Date(last).toLocaleString('ko-KR') : '') + '</div>';
   h += '<button class="pbtn pri" id="bSync">지금 동기화</button><button class="pbtn sec" id="bOut">로그아웃</button><button class="pbtn dng" id="bDis">연결 설정 지우기</button>';
+  h += widgetSection();
   body.innerHTML = h;
+  bindWidgetSection();
   if ($('cpSql')) $('cpSql').onclick = copySql;
   $('bSync').onclick = async () => { await Sync.run(); toast(Sync.err ? '동기화 실패' : '동기화 완료'); };
   $('bOut').onclick = async () => { await sb.auth.signOut(); sbUser = null; setSyncIcon(null); renderSync(); refreshMore(); };
   $('bDis').onclick = () => { if (confirm('Supabase 연결 설정을 지울까요?\n(이 기기에 저장된 가계부 내용은 그대로 남아요)')) { localStorage.removeItem('yunseul_sb'); sb.auth.signOut().catch(() => { }); sb = null; sbUser = null; setSyncIcon(null); renderSync(); refreshMore(); } };
+}
+/* ---------- 위젯 · 단축어 연결 ---------- */
+let wCode = null, wScript = null;
+const SHORTCUT_URL = 'widget/' + encodeURIComponent('가계부 기록') + '.shortcut';
+function widgetSection() {
+  return '<div class="guide" style="margin-top:18px"><b>📱 위젯 · 단축어 연결</b><br>아이폰 위젯(Scriptable 앱)과 "가계부 기록" 단축어가 쓰는 연결 코드예요. 이 코드로는 <b>읽기와 내역 추가만</b> 할 수 있어요. 코드를 새로 만들면 예전 코드는 바로 막혀요.<ol>' +
+    '<li>아래에서 연결 코드를 만들고 복사해 두기</li><li>위젯: App Store에서 Scriptable 설치 → "위젯 코드 복사" → Scriptable 에서 ＋ 새 스크립트에 붙여넣고 ▶ 실행 → 연결 코드 붙여넣기 → 홈 화면에 Scriptable 위젯 추가 후 이 스크립트 선택</li>' +
+    '<li>단축어: "단축어 받기" → 추가할 때 연결 코드 붙여넣기 → 홈 화면에 단축어 위젯 추가</li></ol></div>' +
+    (wCode ? '<textarea id="wCodeBox" readonly class="codearea">' + esc(wCode) + '</textarea><button class="pbtn pri" id="bWCopy">연결 코드 복사</button>' : '<button class="pbtn pri" id="bWKey">연결 코드 만들기</button>') +
+    '<button class="pbtn sec" id="bWScript">위젯 코드 복사 (Scriptable)</button>' +
+    '<a class="pbtn sec" href="' + SHORTCUT_URL + '" download="가계부 기록.shortcut">"가계부 기록" 단축어 받기</a>' +
+    '<button class="pbtn dng" id="bWRevoke">연결 코드 끊기</button>';
+}
+function bindWidgetSection() {
+  if (!wScript) fetch('widget/scriptable.js', { cache: 'no-cache' }).then(r => r.ok ? r.text() : null).then(t => { wScript = t; }).catch(() => { });
+  const copy = (text, msg) => {
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast(msg)).catch(() => toast('복사가 안 되면 길게 눌러 직접 복사해 주세요'));
+    else toast('길게 눌러 직접 복사해 주세요');
+  };
+  if ($('bWKey')) $('bWKey').onclick = async () => {
+    if (wCode && !confirm('연결 코드를 새로 만들면 지금 쓰는 위젯·단축어는 새 코드를 넣기 전까지 멈춰요. 계속할까요?')) return;
+    const { data, error } = await sb.rpc('ys_key_create');
+    if (error) { Sync.needSql = isMissingTable(error) || /ys_key_create|function/i.test(error.message || ''); alert(Sync.needSql ? '먼저 위쪽 SQL을 Supabase에서 한 번 더 실행해 주세요. (위젯용 통로가 새로 추가됐어요)' : '오류: ' + error.message); renderSync(); return; }
+    const cfg = sbCfg(); wCode = 'YSW1|' + cfg.url + '|' + cfg.key + '|' + data; renderSync(); toast('연결 코드를 만들었어요. 복사 버튼을 눌러 주세요');
+  };
+  if ($('bWCopy')) $('bWCopy').onclick = () => { const b = $('wCodeBox'); b.select(); copy(wCode, '연결 코드를 복사했어요'); };
+  $('bWScript').onclick = () => { if (!wScript) { toast('위젯 코드를 불러오는 중이에요. 잠시 후 다시 눌러 주세요'); bindWidgetSection(); return; } copy(wScript, '위젯 코드를 복사했어요. Scriptable 에 붙여넣으세요'); };
+  $('bWRevoke').onclick = async () => {
+    if (!confirm('연결 코드를 끊을까요? 위젯과 단축어가 더 이상 가계부를 읽거나 기록하지 못해요.')) return;
+    const { error } = await sb.rpc('ys_key_revoke'); if (error) { alert('오류: ' + error.message); return; }
+    wCode = null; renderSync(); toast('연결을 끊었어요');
+  };
 }
 function copySql() { const b = $('cpSql'); (navigator.clipboard ? navigator.clipboard.writeText(SQL_TEXT) : Promise.reject()).then(() => { b.textContent = '복사됨'; setTimeout(() => b.textContent = '복사', 1500); }).catch(() => toast('길게 눌러 직접 복사해 주세요')); }
 function cfgForm() { return '<div class="guide"><b>처음 한 번만 (약 5분 · 무료)</b><ol><li><a href="https://supabase.com" target="_blank" rel="noopener">supabase.com</a> 가입 → New project</li><li>SQL Editor 에 아래 SQL 붙여넣고 Run</li><li>Authentication → Sign In / Providers → Email 의 Confirm email 끄기</li><li>Project Settings → API 에서 Project URL 과 anon public key 복사</li></ol></div><div class="sql"><button id="cpSql">복사</button><pre>' + esc(SQL_TEXT) + '</pre></div><div class="ifield"><label>Project URL</label><input id="cU" placeholder="https://xxxx.supabase.co" autocomplete="off"/></div><div class="ifield"><label>anon public key</label><input id="cK" placeholder="eyJhbGci..." autocomplete="off"/></div><button class="pbtn pri" id="bCon">연결하기</button>'; }
