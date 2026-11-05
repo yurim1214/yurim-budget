@@ -1196,8 +1196,9 @@ let wCode = null, wScript = null;
 const SHORTCUT_URL = 'widget/' + encodeURIComponent('가계부 기록') + '.shortcut';
 function widgetSection() {
   return '<div class="guide" style="margin-top:18px"><b>📱 위젯 · 단축어 연결</b><br>아이폰 위젯(Scriptable 앱)과 "가계부 기록" 단축어가 쓰는 연결 코드예요. 이 코드로는 <b>읽기와 내역 추가만</b> 할 수 있어요. 코드를 새로 만들면 예전 코드는 바로 막혀요.<ol>' +
-    '<li>아래에서 연결 코드를 만들고 복사해 두기</li><li>위젯: App Store에서 Scriptable 설치 → "위젯 코드 복사" → Scriptable 에서 ＋ 새 스크립트에 붙여넣고 ▶ 실행 → 연결 코드 붙여넣기 → 홈 화면에 Scriptable 위젯 추가 후 이 스크립트 선택</li>' +
+    '<li>처음 한 번: 아래 「설정 SQL 복사」 → Supabase 사이트 → SQL Editor 에 붙여넣고 Run</li><li>아래에서 연결 코드를 만들고 복사해 두기</li><li>위젯: App Store에서 Scriptable 설치 → "위젯 코드 복사" → Scriptable 에서 ＋ 새 스크립트에 붙여넣고 ▶ 실행 → 연결 코드 붙여넣기 → 홈 화면에 Scriptable 위젯 추가 후 이 스크립트 선택</li>' +
     '<li>단축어: "단축어 받기" → 추가할 때 연결 코드 붙여넣기 → 홈 화면에 단축어 위젯 추가</li></ol></div>' +
+    (Sync.needSql ? '' : '<button class="pbtn sec" id="cpSql">설정 SQL 복사</button>') +
     (wCode ? '<textarea id="wCodeBox" readonly class="codearea">' + esc(wCode) + '</textarea><button class="pbtn pri" id="bWCopy">연결 코드 복사</button>' : '<button class="pbtn pri" id="bWKey">연결 코드 만들기</button>') +
     '<button class="pbtn sec" id="bWScript">위젯 코드 복사 (Scriptable)</button>' +
     '<a class="pbtn sec" href="' + SHORTCUT_URL + '" download="가계부 기록.shortcut">"가계부 기록" 단축어 받기</a>' +
@@ -1223,7 +1224,7 @@ function bindWidgetSection() {
     wCode = null; renderSync(); toast('연결을 끊었어요');
   };
 }
-function copySql() { const b = $('cpSql'); (navigator.clipboard ? navigator.clipboard.writeText(SQL_TEXT) : Promise.reject()).then(() => { b.textContent = '복사됨'; setTimeout(() => b.textContent = '복사', 1500); }).catch(() => toast('길게 눌러 직접 복사해 주세요')); }
+function copySql() { const b = $('cpSql'), t0 = b.textContent; (navigator.clipboard ? navigator.clipboard.writeText(SQL_TEXT) : Promise.reject()).then(() => { b.textContent = '복사됨'; toast('SQL을 복사했어요. Supabase SQL Editor 에 붙여넣고 Run 하세요'); setTimeout(() => b.textContent = t0, 1500); }).catch(() => toast('길게 눌러 직접 복사해 주세요')); }
 function cfgForm() { return '<div class="guide"><b>처음 한 번만 (약 5분 · 무료)</b><ol><li><a href="https://supabase.com" target="_blank" rel="noopener">supabase.com</a> 가입 → New project</li><li>SQL Editor 에 아래 SQL 붙여넣고 Run</li><li>Authentication → Sign In / Providers → Email 의 Confirm email 끄기</li><li>Project Settings → API 에서 Project URL 과 anon public key 복사</li></ol></div><div class="sql"><button id="cpSql">복사</button><pre>' + esc(SQL_TEXT) + '</pre></div><div class="ifield"><label>Project URL</label><input id="cU" placeholder="https://xxxx.supabase.co" autocomplete="off"/></div><div class="ifield"><label>anon public key</label><input id="cK" placeholder="eyJhbGci..." autocomplete="off"/></div><button class="pbtn pri" id="bCon">연결하기</button>'; }
 function bindCfg() {
   $('cpSql').onclick = copySql;
